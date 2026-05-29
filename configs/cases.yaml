@@ -1,0 +1,87 @@
+defaults:
+  host: 127.0.0.1
+  base_port: 18000
+  health_timeout_s: 600
+  startup_poll_interval_s: 5
+  warmup_prompts: 30
+  request_timeout_s: 300
+  seed: 42
+  prompt_char: A
+  stop_after_case: true
+
+cases:
+  - name: vllm_normal_1gpu
+    enabled: false
+    framework: vllm
+    mode: normal
+    pd_layout: null
+    model_path: /path/to/model
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+    ep_size: 1
+    atten_cp_size: 1
+    quantization: null
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    input_len: 1024
+    output_len: 128
+    concurrency: 16
+    num_prompts: 200
+
+  - name: vllm_pd_1p1d
+    enabled: false
+    framework: vllm
+    mode: pd
+    pd_layout: 1P1D
+    model_path: /path/to/model
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+    ep_size: 1
+    atten_cp_size: 1
+    quantization: null
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    input_len: 1024
+    output_len: 128
+    concurrency: 16
+    num_prompts: 200
+
+  - name: sglang_normal_1gpu
+    enabled: false
+    framework: sglang
+    mode: normal
+    pd_layout: null
+    model_path: /path/to/model
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+    ep_size: 1
+    atten_cp_size: 1
+    quantization: null
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    input_len: 1024
+    output_len: 128
+    concurrency: 16
+    num_prompts: 200
+
+  - name: sglang_pd_1p1d
+    enabled: false
+    framework: sglang
+    mode: pd
+    pd_layout: 1P1D
+    model_path: /path/to/model
+    tp_size: 1
+    pp_size: 1
+    dp_size: 1
+    ep_size: 1
+    atten_cp_size: 1
+    quantization: null
+    max_num_batched_tokens: 8192
+    max_num_seqs: 256
+    input_len: 1024
+    output_len: 128
+    concurrency: 16
+    num_prompts: 200
