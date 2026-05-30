@@ -230,7 +230,7 @@ def bench_command(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
     group_size = max(prompts, concurrency, 1)
     backend = bench.get("backend", "sglang-oai-chat")
     served_model_name = server.get("served_model_name", server.get("model_name", server["model_path"]))
-    model_arg = server["model_path"] if backend == "sglang" and bench.get("tokenize_prompt", False) else served_model_name
+    model_arg = server["model_path"] if backend == "sglang" else served_model_name
     args = [
         "python",
         "-m",
