@@ -27,7 +27,170 @@
 | Attention CP | `--attn-cp-size N` | 超长上下文 attention | 切分 attention context 维度 | 通信更多，调优复杂 |
 | PD 分离 | `--disaggregation-mode prefill/decode` + router | prefill 和 decode 相互干扰的场景 | prefill/decode 独立扩缩容 | KV transfer 和多服务编排复杂 |
 
-## 2. 各配置方式说明
+## 2. 模型类型判断与注意力类型
+
+选择 SGLang 并行配置前，建议先判断模型属于 Dense 还是 MoE，以及 attention 是 MHA、MQA、GQA 还是 MLA。最可靠的方式是看模型目录下的 `config.json`，不要只根据模型名字判断。
+
+### 2.1 判断 Dense 还是 MoE
+
+查看模型配置：
+
+```bash
+cat /path/to/model/config.json | jq .
+```
+
+重点关注这些字段：
+
+```json
+"model_type": "...",
+"architectures": [...],
+"num_experts": ...,
+"n_routed_experts": ...,
+"num_local_experts": ...,
+"moe_intermediate_size": ...,
+"num_experts_per_tok": ...
+```
+
+如果出现 `num_experts`、`n_routed_experts`、`num_local_experts`、`num_experts_per_tok`、`moe_intermediate_size` 等字段，通常就是 MoE 模型。否则多数是 Dense 模型。
+
+常见例子：
+
+- Dense：Qwen2.5-7B、Qwen2.5-32B、Llama、Mistral dense 版本。
+- MoE：Qwen3-235B-A22B、Qwen3-30B-A3B、DeepSeek-V2、DeepSeek-V3、DeepSeek-R1。
+
+配置选择：
+
+- Dense 模型：先做 TP baseline，再考虑 SMG DP、DPA 或 PP。
+- MoE 模型：先做 TP baseline，再评估 EP、DeepEP、DPA + EP、TPCP + EP。
+
+### 2.2 判断 MHA / MQA / GQA
+
+普通 attention 类型主要看：
+
+```json
+"num_attention_heads": 64,
+"num_key_value_heads": 8
+```
+
+判断规则：
+
+```text
+num_key_value_heads == num_attention_heads       => MHA
+num_key_value_heads == 1                         => MQA
+1 < num_key_value_heads < num_attention_heads    => GQA
+```
+
+三者区别：
+
+| 类型 | 含义 | KV head 特征 | 优势 | 代价和注意事项 |
+| --- | --- | --- | --- | --- |
+| MHA | Multi-Head Attention | 每个 query head 都有独立 KV head | 表达能力强，经典结构 | KV cache 最大，长上下文显存压力大 |
+| MQA | Multi-Query Attention | 所有 query head 共享 1 组 KV head | KV cache 最省，decode 友好 | 可能影响模型质量，结构弹性较小 |
+| GQA | Grouped-Query Attention | 多个 query head 共享一组 KV head | 在质量和 KV cache 之间折中 | 仍有 KV cache 压力，但小于 MHA |
+
+并行配置影响：
+
+- MHA：KV cache 压力最大，长上下文时更容易需要 KV dtype、chunked prefill、Attention CP 或 PD 分离。
+- MQA：KV cache 压力最小，吞吐瓶颈更多可能在计算、batch 调度或通信上。
+- GQA：当前 Qwen/Llama 等常见模型大量使用 GQA，通常先用 TP，再根据吞吐和显存评估 SMG DP 或 DPA。
+
+### 2.3 判断 MLA
+
+MLA 是 Multi-head Latent Attention，DeepSeek 系列中常见。它不是简单地看 `num_key_value_heads` 就能判断，通常要看这些字段：
+
+```json
+"kv_lora_rank": ...,
+"q_lora_rank": ...,
+"qk_rope_head_dim": ...,
+"qk_nope_head_dim": ...,
+"v_head_dim": ...
+```
+
+如果 `config.json` 中出现 `kv_lora_rank`、`q_lora_rank`、`qk_rope_head_dim`、`qk_nope_head_dim`、`v_head_dim` 这类字段，基本可以判断为 DeepSeek-style MLA。
+
+MLA 的特点：
+
+- 通过 latent KV 表示降低 KV cache 压力。
+- attention 实现和普通 MHA/GQA 不同。
+- 在高吞吐、长上下文、MoE 场景下，DPA 往往更值得评估。
+
+并行配置影响：
+
+- Dense + MLA：先 TP，再评估 DPA。
+- MoE + MLA：重点评估 DPA + EP + DeepEP。
+- 如果 attention/context 和 MoE 侧瓶颈不同，再评估 TPCP + EP，并尝试 `--moe-tp-size 1` 或 `--moe-dense-tp-size 1`。
+
+### 2.4 判断长上下文能力
+
+重点看：
+
+```json
+"max_position_embeddings": ...,
+"rope_scaling": ...,
+"rope_theta": ...
+```
+
+如果 `max_position_embeddings` 是 32768、65536、131072 或更大，就应该按长上下文模型处理。
+
+长上下文测试重点：
+
+- prefill 耗时和 TTFT。
+- KV cache 显存。
+- `--chunked-prefill-size`。
+- `--page-size`。
+- `--kv-cache-dtype`。
+- radix-cache 命中率。
+- Attention CP 或 PD 分离是否能改善尾延迟。
+
+### 2.5 快速识别脚本
+
+可以在模型容器中运行：
+
+```bash
+python - <<'PY'
+import json
+p = "/path/to/model/config.json"
+c = json.load(open(p, encoding="utf-8"))
+
+heads = c.get("num_attention_heads")
+kv = c.get("num_key_value_heads")
+moe_keys = ["num_experts", "n_routed_experts", "num_local_experts", "num_experts_per_tok", "moe_intermediate_size"]
+mla_keys = ["kv_lora_rank", "q_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "v_head_dim"]
+
+print("model_type:", c.get("model_type"))
+print("architectures:", c.get("architectures"))
+print("is_moe:", any(k in c for k in moe_keys))
+print("moe_fields:", {k: c.get(k) for k in moe_keys if k in c})
+print("is_mla:", any(k in c for k in mla_keys))
+print("mla_fields:", {k: c.get(k) for k in mla_keys if k in c})
+
+if heads and kv:
+    if kv == heads:
+        attn = "MHA"
+    elif kv == 1:
+        attn = "MQA"
+    else:
+        attn = "GQA"
+    print("attention:", attn, f"heads={heads}, kv_heads={kv}")
+
+print("max_position_embeddings:", c.get("max_position_embeddings"))
+print("rope_scaling:", c.get("rope_scaling"))
+PY
+```
+
+### 2.6 类型到配置的快速映射
+
+| 模型类型 | 推荐起点 | 进一步评估 |
+| --- | --- | --- |
+| Dense + MHA | TP | KV dtype、chunked prefill、Attention CP、PP、PD |
+| Dense + MQA | TP | SMG DP、batch 调度、吞吐扫描 |
+| Dense + GQA | TP | SMG DP、DPA、PP |
+| Dense + MLA | TP | DPA、Attention CP、PD |
+| MoE + GQA | TP baseline | EP、DeepEP、SMG DP |
+| MoE + MLA | TP baseline | DPA + EP + DeepEP、TPCP + EP、MoE-DP |
+| 长上下文模型 | TP + 长上下文参数 | radix-cache、chunked prefill、KV dtype、Attention CP、PD |
+
+## 3. 各配置方式说明
 
 ### TP: Tensor Parallelism
 
@@ -363,7 +526,7 @@ python -m sglang_router.launch_router \
 - 服务数量和日志更多。
 - 比 IFB / 非 PD 模式有更多故障点。
 
-## 3. 配置决策流程
+## 4. 配置决策流程
 
 1. 先确认模型能否放下。
    - 单卡能放下：先做单卡 baseline。
@@ -391,7 +554,7 @@ python -m sglang_router.launch_router \
    - 逐步加入：DPA、EP、DeepEP、overlap、PP、CP。
    - 每步记录 TTFT、TPOT、P90/P99、RPS、输出吞吐、总吞吐、cache hit、GPU 显存和 OOM/error。
 
-## 4. 常见命令模板
+## 5. 常见命令模板
 
 ### Dense 模型，单节点 TP
 
@@ -503,7 +666,7 @@ python -m sglang.launch_server \
   --node-rank 1
 ```
 
-## 5. 在本工程中的配置方式
+## 6. 在本工程中的配置方式
 
 在 `configs/cases.yaml` 或 `configs/ifb_matrix.yaml` 中，可以按下面方式映射：
 
@@ -545,7 +708,7 @@ extra_args:
   - "1"
 ```
 
-## 6. 全量测试前检查清单
+## 7. 全量测试前检查清单
 
 服务检查：
 
@@ -571,7 +734,7 @@ extra_args:
 4. 放开完整并发扫描。
 5. 对最优点重复测试，确认稳定性。
 
-## 7. 实用建议
+## 8. 实用建议
 
 - Dense 单节点：从 TP 开始。
 - Dense 多副本：优先 SMG DP，并使用 cache-aware routing。
