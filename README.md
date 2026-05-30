@@ -107,6 +107,7 @@ python benchmark/parse_logs.py
 ```bash
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --dry-run
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --reuse-server
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --smoke-all-hit-rates --reuse-server --no-resume
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml
 ```
 

@@ -346,6 +346,40 @@ def merge_detail_metrics(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def capture_server_cache_log(cfg: dict[str, Any], tag: str) -> str:
+    remote = cfg["remote"]["ssh_target"]
+    container = cfg["remote"]["docker_container"]
+    remote_dir = cfg["reports"]["remote_dir"]
+    excerpt_file = f"{remote_dir}/logs/{tag}.server_cache.log"
+    cmd = (
+        "grep -Ei 'Prefill batch|cached-token|new-token|radix|prefix|cache hit|hit rate' "
+        f"{q(remote_dir)}/logs/server.log | tail -400 > {q(excerpt_file)} || true"
+    )
+    docker_exec(remote, container, cmd, timeout=60, check=False)
+    return excerpt_file
+
+
+def summarize_server_cache_excerpt(cfg: dict[str, Any], excerpt_file: str) -> dict[str, Any]:
+    remote = cfg["remote"]["ssh_target"]
+    container = cfg["remote"]["docker_container"]
+    py = (
+        "import json,os,re;"
+        f"p={excerpt_file!r};"
+        "text=open(p, encoding='utf-8', errors='ignore').read() if os.path.exists(p) else '';"
+        "pairs=[(int(a), int(b)) for a,b in re.findall(r'#new-token:\\s*(\\d+).*?#cached-token:\\s*(\\d+)', text)];"
+        "new=sum(a for a,b in pairs); cached=sum(b for a,b in pairs);"
+        "ratio=(cached/(new+cached) if (new+cached) else None);"
+        "print(json.dumps({'server_prefill_batches':len(pairs),'server_new_tokens':new,'server_cached_tokens':cached,'server_observed_cache_ratio':ratio}))"
+    )
+    result = docker_exec(remote, container, f"python -c {q(py)}", timeout=60, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    try:
+        return json.loads(result.stdout.strip().splitlines()[-1])
+    except json.JSONDecodeError:
+        return {}
+
+
 def read_remote_json_summary(cfg: dict[str, Any], output_file: str) -> dict[str, Any]:
     remote = cfg["remote"]["ssh_target"]
     container = cfg["remote"]["docker_container"]
@@ -415,15 +449,24 @@ tail -200 {q(log_file)}
     data.update({k: v for k, v in parse_text_metrics(text).items() if k not in data})
     detail_data = read_remote_json_summary(cfg, output_file)
     data.update({k: v for k, v in detail_data.items() if v not in (None, "")})
+    server_cache_log = capture_server_cache_log(cfg, tag)
+    cache_data = summarize_server_cache_excerpt(cfg, server_cache_log)
+    data.update({k: v for k, v in cache_data.items() if v not in (None, "")})
     row = {
         "tag": tag,
         "input_len": input_len,
         "output_len": output_len,
         "radix_cache_hit_rate_target": hit_rate,
+        "gsp_shared_len": shared_len,
+        "gsp_question_len": question_len,
         "concurrency": concurrency,
         "returncode": result.returncode,
         "remote_output_file": output_file,
         "remote_log_file": log_file,
+        "remote_server_cache_log": server_cache_log,
+        "server_observed_cache_ratio": normalize_metric(data, ["server_observed_cache_ratio"]),
+        "server_cached_tokens": normalize_metric(data, ["server_cached_tokens"]),
+        "server_new_tokens": normalize_metric(data, ["server_new_tokens"]),
         "mean_ttft_ms": normalize_metric(data, ["mean_ttft_ms", "mean_ttft", "avg_ttft_ms"]),
         "p90_ttft_ms": normalize_metric(data, ["p90_ttft_ms", "p90_ttft"]),
         "p99_ttft_ms": normalize_metric(data, ["p99_ttft_ms", "p99_ttft"]),
@@ -494,7 +537,14 @@ def read_existing_rows(local_dir: Path) -> list[dict[str, Any]]:
         return list(csv.DictReader(f))
 
 
-def run_matrix(cfg: dict[str, Any], dry_run: bool, smoke: bool, reuse_server: bool, resume: bool) -> list[dict[str, Any]]:
+def run_matrix(
+    cfg: dict[str, Any],
+    dry_run: bool,
+    smoke: bool,
+    smoke_all_hit_rates: bool,
+    reuse_server: bool,
+    resume: bool,
+) -> list[dict[str, Any]]:
     if smoke:
         cfg = copy.deepcopy(cfg)
         cfg["benchmark"]["num_prompts"] = 2
@@ -508,7 +558,8 @@ def run_matrix(cfg: dict[str, Any], dry_run: bool, smoke: bool, reuse_server: bo
     concurrencies = concurrency_values(cfg["benchmark"]["concurrency_scan"])
     if smoke:
         pairs = pairs[:1]
-        hit_rates = hit_rates[:1]
+        if not smoke_all_hit_rates:
+            hit_rates = hit_rates[:1]
         concurrencies = concurrencies[:1]
     if dry_run:
         logging.info("Would run %d benchmark points", len(pairs) * len(hit_rates) * len(concurrencies))
@@ -543,8 +594,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(ROOT_DIR / "configs" / "ifb_matrix.yaml"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run only the first point to validate the flow.")
+    parser.add_argument("--smoke-all-hit-rates", action="store_true", help="With --smoke, run all configured radix-cache hit rates for the first input/output pair and first concurrency.")
     parser.add_argument("--reuse-server", action="store_true", help="Reuse an already running SGLang server and do not stop it.")
     parser.add_argument("--no-resume", action="store_true", help="Do not reuse existing local result.csv rows.")
+    parser.add_argument("--ssh-target", help="Override remote.ssh_target from the config, for example nmz22.")
+    parser.add_argument("--client-host", help="Override remote.client_host from the config.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -554,7 +608,11 @@ def main() -> int:
     setup_logging(args.verbose)
     try:
         cfg = load_config(Path(args.config))
-        rows = run_matrix(cfg, args.dry_run, args.smoke, args.reuse_server, not args.no_resume)
+        if args.ssh_target:
+            cfg["remote"]["ssh_target"] = args.ssh_target
+        if args.client_host:
+            cfg["remote"]["client_host"] = args.client_host
+        rows = run_matrix(cfg, args.dry_run, args.smoke, args.smoke_all_hit_rates, args.reuse_server, not args.no_resume)
         if rows:
             write_reports(ROOT_DIR / cfg["reports"]["local_dir"], rows)
         return 0

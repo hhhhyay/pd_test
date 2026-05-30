@@ -121,7 +121,7 @@ benchmark:
   radix_cache_hit_rates:
     - 0.50
     - 0.90
-    - 1.00
+    - 0.99
   sla:
     mean_ttft_s_lt: 10
     mean_tpot_ms_lt: 75
