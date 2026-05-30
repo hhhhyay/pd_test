@@ -108,6 +108,8 @@ python benchmark/parse_logs.py
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --dry-run
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --reuse-server
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --smoke-all-hit-rates --reuse-server --no-resume
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --smoke-all-hit-rates --smoke-prompts 4 --smoke-warmup-requests 0 --reuse-server --no-resume
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --ssh-target guobj@10.16.1.9 --nested-ssh-target nmz22 --docker-container <container-name> --smoke --smoke-all-hit-rates --reuse-server --no-resume
 python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml
 ```
 

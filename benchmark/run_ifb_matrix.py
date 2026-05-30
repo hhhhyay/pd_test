@@ -61,7 +61,30 @@ def run_local(cmd: list[str], timeout: int | None = None, check: bool = True) ->
     return result
 
 
+def remote_target(cfg: dict[str, Any]) -> str:
+    remote = cfg["remote"]["ssh_target"]
+    nested = cfg["remote"].get("nested_ssh_target")
+    if nested:
+        return f"{remote}||{nested}"
+    return remote
+
+
 def ssh(remote: str, command: str, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if "||" in remote:
+        outer, inner = remote.split("||", 1)
+        nested_cmd = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            inner,
+            command,
+        ]
+        command = " ".join(q(x) for x in nested_cmd)
+        remote = outer
     return run_local(["ssh", "-o", "BatchMode=yes", remote, command], timeout=timeout, check=check)
 
 
@@ -99,14 +122,14 @@ def gsp_lengths(input_len: int, hit_rate: float) -> tuple[int, int]:
 
 
 def ensure_remote_dirs(cfg: dict[str, Any]) -> None:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
     docker_exec(remote, container, f"mkdir -p {q(remote_dir)}/logs {q(remote_dir)}/bench")
 
 
 def cleanup_server(cfg: dict[str, Any]) -> None:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
     cmd = f"""
@@ -182,7 +205,7 @@ def server_env_prefix(cfg: dict[str, Any]) -> str:
 
 
 def start_server(cfg: dict[str, Any]) -> None:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     workdir = cfg["remote"]["workdir"]
     remote_dir = cfg["reports"]["remote_dir"]
@@ -198,7 +221,7 @@ echo "$!" > {q(remote_dir)}/server.pid
 
 
 def wait_ready(cfg: dict[str, Any]) -> None:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     host = cfg["remote"].get("client_host", "127.0.0.1")
     port = int(cfg["remote"]["port"])
@@ -346,21 +369,36 @@ def merge_detail_metrics(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def capture_server_cache_log(cfg: dict[str, Any], tag: str) -> str:
-    remote = cfg["remote"]["ssh_target"]
+def server_log_line_count(cfg: dict[str, Any]) -> int:
+    remote = remote_target(cfg)
+    container = cfg["remote"]["docker_container"]
+    remote_dir = cfg["reports"]["remote_dir"]
+    result = docker_exec(remote, container, f"wc -l < {q(remote_dir)}/logs/server.log", timeout=60, check=False)
+    if result.returncode != 0:
+        return 0
+    try:
+        return int(result.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def capture_server_cache_log(cfg: dict[str, Any], tag: str, start_line: int) -> str:
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
     excerpt_file = f"{remote_dir}/logs/{tag}.server_cache.log"
+    from_line = max(start_line + 1, 1)
     cmd = (
+        f"tail -n +{from_line} {q(remote_dir)}/logs/server.log | "
         "grep -Ei 'Prefill batch|cached-token|new-token|radix|prefix|cache hit|hit rate' "
-        f"{q(remote_dir)}/logs/server.log | tail -400 > {q(excerpt_file)} || true"
+        f"> {q(excerpt_file)} || true"
     )
     docker_exec(remote, container, cmd, timeout=60, check=False)
     return excerpt_file
 
 
 def summarize_server_cache_excerpt(cfg: dict[str, Any], excerpt_file: str) -> dict[str, Any]:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     py = (
         "import json,os,re;"
@@ -381,7 +419,7 @@ def summarize_server_cache_excerpt(cfg: dict[str, Any], excerpt_file: str) -> di
 
 
 def read_remote_json_summary(cfg: dict[str, Any], output_file: str) -> dict[str, Any]:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     keys = [
         "completed",
@@ -421,7 +459,7 @@ def read_remote_json_summary(cfg: dict[str, Any], output_file: str) -> dict[str,
 
 
 def run_one_bench(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate: float, concurrency: int) -> dict[str, Any]:
-    remote = cfg["remote"]["ssh_target"]
+    remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
     tag = f"in{input_len}_out{output_len}_hit{int(hit_rate * 100)}_bs{concurrency}"
@@ -443,13 +481,14 @@ set -euo pipefail
 tail -200 {q(log_file)}
 """
     logging.info("Benchmark %s", tag)
+    server_start_line = server_log_line_count(cfg)
     result = docker_exec(remote, container, cmd, timeout=None, check=False)
     text = result.stdout + "\n" + result.stderr
     data = parse_jsonish(text)
     data.update({k: v for k, v in parse_text_metrics(text).items() if k not in data})
     detail_data = read_remote_json_summary(cfg, output_file)
     data.update({k: v for k, v in detail_data.items() if v not in (None, "")})
-    server_cache_log = capture_server_cache_log(cfg, tag)
+    server_cache_log = capture_server_cache_log(cfg, tag, server_start_line)
     cache_data = summarize_server_cache_excerpt(cfg, server_cache_log)
     data.update({k: v for k, v in cache_data.items() if v not in (None, "")})
     row = {
@@ -542,13 +581,15 @@ def run_matrix(
     dry_run: bool,
     smoke: bool,
     smoke_all_hit_rates: bool,
+    smoke_prompts: int,
+    smoke_warmup_requests: int,
     reuse_server: bool,
     resume: bool,
 ) -> list[dict[str, Any]]:
     if smoke:
         cfg = copy.deepcopy(cfg)
-        cfg["benchmark"]["num_prompts"] = 2
-        cfg["benchmark"]["warmup_requests"] = 1
+        cfg["benchmark"]["num_prompts"] = smoke_prompts
+        cfg["benchmark"]["warmup_requests"] = smoke_warmup_requests
     ensure_remote_dirs(cfg)
     local_dir = ROOT_DIR / cfg["reports"]["local_dir"]
     rows: list[dict[str, Any]] = read_existing_rows(local_dir) if resume else []
@@ -595,9 +636,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run only the first point to validate the flow.")
     parser.add_argument("--smoke-all-hit-rates", action="store_true", help="With --smoke, run all configured radix-cache hit rates for the first input/output pair and first concurrency.")
+    parser.add_argument("--smoke-prompts", type=int, default=2, help="Number of formal prompts for --smoke.")
+    parser.add_argument("--smoke-warmup-requests", type=int, default=1, help="Warmup requests for --smoke.")
     parser.add_argument("--reuse-server", action="store_true", help="Reuse an already running SGLang server and do not stop it.")
     parser.add_argument("--no-resume", action="store_true", help="Do not reuse existing local result.csv rows.")
     parser.add_argument("--ssh-target", help="Override remote.ssh_target from the config, for example nmz22.")
+    parser.add_argument("--nested-ssh-target", help="Run commands through remote.ssh_target and then SSH to this inner target, for example nmz22.")
+    parser.add_argument("--docker-container", help="Override remote.docker_container from the config.")
     parser.add_argument("--client-host", help="Override remote.client_host from the config.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
@@ -610,9 +655,22 @@ def main() -> int:
         cfg = load_config(Path(args.config))
         if args.ssh_target:
             cfg["remote"]["ssh_target"] = args.ssh_target
+        if args.nested_ssh_target:
+            cfg["remote"]["nested_ssh_target"] = args.nested_ssh_target
+        if args.docker_container:
+            cfg["remote"]["docker_container"] = args.docker_container
         if args.client_host:
             cfg["remote"]["client_host"] = args.client_host
-        rows = run_matrix(cfg, args.dry_run, args.smoke, args.smoke_all_hit_rates, args.reuse_server, not args.no_resume)
+        rows = run_matrix(
+            cfg,
+            args.dry_run,
+            args.smoke,
+            args.smoke_all_hit_rates,
+            args.smoke_prompts,
+            args.smoke_warmup_requests,
+            args.reuse_server,
+            not args.no_resume,
+        )
         if rows:
             write_reports(ROOT_DIR / cfg["reports"]["local_dir"], rows)
         return 0
