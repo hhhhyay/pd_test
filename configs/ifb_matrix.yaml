@@ -89,7 +89,8 @@ server:
     - "64"
 
 benchmark:
-  backend: sglang
+  # sglang-oai uses the OpenAI-compatible /v1/completions endpoint.
+  backend: sglang-oai
   num_prompts: 256
   warmup_requests: 30
   request_rate: inf

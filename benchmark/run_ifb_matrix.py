@@ -405,7 +405,8 @@ def run_one_bench(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
     cmd = f"""
 set -euo pipefail
 {clear_cache}
-{bench_command(cfg, input_len, output_len, hit_rate, concurrency, output_file)} 2>&1 | tee {q(log_file)}
+{bench_command(cfg, input_len, output_len, hit_rate, concurrency, output_file)} > {q(log_file)} 2>&1
+tail -200 {q(log_file)}
 """
     logging.info("Benchmark %s", tag)
     result = docker_exec(remote, container, cmd, timeout=None, check=False)
