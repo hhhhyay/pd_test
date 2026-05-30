@@ -114,6 +114,7 @@ python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml
 ```
 
 详细说明见 `docs/ifb_sglang_matrix.md`。
+SGLang 并行配置方式整理见 `docs/sglang_parallel_config_guide.md`。
 
 压测程序会对每个 case 至少 warmup 30 条请求，再正式测试。主要输出：
 
