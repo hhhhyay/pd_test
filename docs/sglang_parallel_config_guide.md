@@ -22,6 +22,7 @@
 | EP | `--ep N` / `--ep-size N` | MoE 模型 | 切分 expert 权重和 expert 计算 | token all-to-all 路由成本 |
 | DeepEP | `--moe-a2a-backend deepep` | 大规模 MoE EP | 优化 token dispatch/combine | 对硬件、构建和拓扑有要求 |
 | DPA + EP | `--tp N --dp-size D --ep E --enable-dp-attention --moe-a2a-backend deepep` | DeepSeek 类大 MoE 模型 | attention DP 和 expert sharding 同时生效 | 拓扑最复杂，需要逐项验证 |
+| TPCP + EP | `--tp N --dp-size D --enable-dp-attention --ep E --moe-tp-size 1` | 大 MoE / MLA 模型，attention 走 TPCP，MoE 走 EP | attention、context、expert 维度解耦，适合长上下文和高吞吐 | 参数依赖版本，需确认 `--moe-tp-size` 或 `--moe-dense-tp-size` |
 | MoE-DP | `--moe-dp-size N` | 高级 MoE 拓扑调优 | 单独调 MoE 层的数据并行维度 | 新路径，需确认版本支持 |
 | Attention CP | `--attn-cp-size N` | 超长上下文 attention | 切分 attention context 维度 | 通信更多，调优复杂 |
 | PD 分离 | `--disaggregation-mode prefill/decode` + router | prefill 和 decode 相互干扰的场景 | prefill/decode 独立扩缩容 | KV transfer 和多服务编排复杂 |
@@ -235,6 +236,53 @@ python -m sglang.launch_server \
 - 目标是高并发、高吞吐。
 - KV cache 显存和 expert 权重显存都是瓶颈。
 
+### TPCP + EP
+
+TPCP + EP 可以理解为：attention 侧使用 TP + CP / DPA 相关切分，MoE expert 侧使用 EP，并通过 `--moe-tp-size 1` 或 `--moe-dense-tp-size 1` 让 MoE dense/MLP 相关路径不要继续沿用完整 TP 切分。这样可以把 attention/context 并行和 MoE expert 并行拆开调。
+
+常见参数形态：
+
+```bash
+python -m sglang.launch_server \
+  --model-path /model/moe-mla \
+  --tp 8 \
+  --dp-size 4 \
+  --enable-dp-attention \
+  --attn-cp-size 2 \
+  --ep 8 \
+  --moe-a2a-backend deepep \
+  --moe-runner-backend deep_gemm \
+  --moe-tp-size 1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+如果当前 SGLang 版本没有 `--moe-tp-size`，通常需要使用官方文档中出现的参数名：
+
+```bash
+--moe-dense-tp-size 1
+```
+
+建议先在目标容器里确认参数名：
+
+```bash
+python -m sglang.launch_server --help | grep -E 'moe.*tp|dense.*tp|attn-cp|dp-attention'
+```
+
+适合使用 TPCP + EP 的情况：
+
+- 模型是大 MoE / MLA，attention 和 MoE 层的最优并行维度不同。
+- 长上下文 prefill 明显，需要 attention/context 侧并行减压。
+- expert 侧希望用 EP / DeepEP 做 token dispatch，而不是让 MoE dense 路径继续吃完整 TP。
+- 需要在 `TP / DP attention / CP / EP` 之间做细粒度组合调优。
+
+注意事项：
+
+- `--moe-tp-size 1` / `--moe-dense-tp-size 1` 的实际名字依赖 SGLang 版本或厂商分支。
+- DeepEP、Mooncake、NIXL-EP、MORI 等后端通常仍要求 `ep_size == tp_size`，除非本地版本明确支持 hybrid。
+- 如果用了 DPA，仍要满足 `tp_size % dp_size == 0`。
+- TPCP + EP 属于高级拓扑，建议先跑 TP-only、DPA、EP，再组合验证。
+
 ### MoE-DP
 
 常用参数：
@@ -398,6 +446,29 @@ python -m sglang.launch_server \
   --port 30000
 ```
 
+### TPCP + EP，MoE TP 置 1
+
+```bash
+python -m sglang.launch_server \
+  --model-path /model/moe-mla \
+  --tp 8 \
+  --dp-size 4 \
+  --enable-dp-attention \
+  --attn-cp-size 2 \
+  --ep 8 \
+  --moe-a2a-backend deepep \
+  --moe-runner-backend deep_gemm \
+  --moe-tp-size 1 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+如果当前版本参数名是官方文档里的 `--moe-dense-tp-size`，则替换为：
+
+```bash
+--moe-dense-tp-size 1
+```
+
 ### 长上下文调试模板
 
 ```bash
@@ -452,6 +523,8 @@ extra_args:
   - deep_gemm
   - --deepep-mode
   - auto
+  - --moe-tp-size
+  - "1"
 ```
 
 高级 MoE-DP：
@@ -463,6 +536,14 @@ extra_args:
 ```
 
 SMG DP 需要使用 router 入口，而不是直接 `sglang.launch_server`。当前 IFB runner 主要面向单个 SGLang server 进程；如果要做生产 SMG benchmark，建议增加单独 deploy wrapper，先启动 workers 和 router，再让压测客户端访问 router 端口。
+
+如果当前 SGLang 版本使用 `--moe-dense-tp-size` 而不是 `--moe-tp-size`，则在 `extra_args` 中替换参数名即可：
+
+```yaml
+extra_args:
+  - --moe-dense-tp-size
+  - "1"
+```
 
 ## 6. 全量测试前检查清单
 
@@ -479,6 +560,7 @@ SMG DP 需要使用 router 入口，而不是直接 `sglang.launch_server`。当
 - radix cache：看 `Prefill batch` 中的 `#cached-token` 和 `#new-token`。
 - DPA：确认 `dp_size > 1`，且日志没有提示 DPA 被禁用。
 - DeepEP：确认后端初始化成功；除非本地构建明确支持混合路径，否则保证 `ep_size == tp_size`。
+- TPCP + EP：确认 `--moe-tp-size` 或 `--moe-dense-tp-size` 被当前版本识别，并检查日志里 MoE TP / EP / attention CP 的实际生效值。
 - PD：确认 prefill、decode、router 都健康，KV transfer 没有反复 timeout 或 OOM。
 
 推荐测试顺序：
@@ -495,7 +577,7 @@ SMG DP 需要使用 router 入口，而不是直接 `sglang.launch_server`。当
 - Dense 多副本：优先 SMG DP，并使用 cache-aware routing。
 - MLA 模型：如果吞吐和 KV 显存是瓶颈，评估 DPA。
 - MoE 模型：先 TP-only baseline，再 EP，再 DeepEP。
-- 大 MoE + MLA：DPA + EP + DeepEP 通常是高吞吐目标配置。
+- 大 MoE + MLA：DPA + EP + DeepEP 通常是高吞吐目标配置；如果 attention/context 和 MoE 侧瓶颈不同，再评估 TPCP + EP，并尝试 `--moe-tp-size 1` / `--moe-dense-tp-size 1`。
 - 超长上下文：重点调 chunked prefill、KV dtype、page size，必要时评估 Attention CP。
 - prefill/decode 混部导致 TPOT 尾延迟差：评估 PD 分离。
 - 生产 DP：优先 SMG，不建议长期使用 Native DP。
