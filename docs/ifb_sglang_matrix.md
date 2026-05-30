@@ -1,0 +1,68 @@
+# IFB SGLang Radix-Cache Matrix
+
+This workflow runs non-PD IFB tests for SGLang on a remote SSH + Docker node.
+It is model-agnostic: update `configs/ifb_matrix.yaml` with a new `model_path`,
+parallel sizes, server args, and input/output matrix.
+
+## Current NMZ Case
+
+- SSH node: `guobj@10.16.1.9`
+- Container: `gbj_sgl_0522`
+- Workdir: `/mnt11/task/sgl`
+- Model: `/model/qwen3.5/Qwen3.5-397B-A17B-Channel-FP8`
+- Mode: IFB / non-PD
+- Input/output pairs: `(2048,1024)`, `(65536,1024)`, `(32768,128)`
+- Target radix-cache hit rates: `50%`, `90%`, `100%`
+- Concurrency scan: `1..32 step 1`, `34..64 step 2`, `68..128 step 4`
+- SLA: `mean TTFT < 10s`, `mean TPOT < 75ms`
+
+The SGLang startup arguments are based on the Feishu guide section
+`Qwen3.5-397B-A17B-Channel-FP8 -> NMZ`. That guide notes that enabling
+radix-cache requires `--mamba-scheduler-strategy extra_buffer` and may affect
+accuracy, so this is represented as an explicit config switch.
+
+## Run
+
+```bash
+pip install -r requirements.txt
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --dry-run
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml
+```
+
+Reports are written to:
+
+```text
+reports/ifb_sglang_qwen3_397_fp8_nmz/result.csv
+reports/ifb_sglang_qwen3_397_fp8_nmz/result.html
+```
+
+The remote raw benchmark files and logs are written under:
+
+```text
+/mnt11/task/sgl/pd_test_runs/ifb_sglang_qwen3_397_fp8_nmz
+```
+
+## Replace The Model
+
+Edit these fields for most new models:
+
+```yaml
+server:
+  model_name: your-model-name
+  model_path: /path/to/model
+  served_model_name: your-model-name
+  tp_size: 8
+  pp_size: 1
+  dp_size: 1
+  ep_size: 1
+  atten_cp_size: 1
+  quantization: null
+  max_running_requests: 512
+  max_total_tokens: 131072
+  extra_args:
+    - --trust-remote-code
+```
+
+For CUDA environments, remove the DCU-specific `env` keys and adjust
+attention/KV-cache args according to the local SGLang build.

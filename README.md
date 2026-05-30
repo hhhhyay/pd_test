@@ -100,6 +100,18 @@ python benchmark/run_bench.py
 python benchmark/parse_logs.py
 ```
 
+## 运行 SGLang IFB 矩阵测试
+
+非 PD/IFB 的远端矩阵测试入口见 `configs/ifb_matrix.yaml` 和 `benchmark/run_ifb_matrix.py`。当前模板覆盖 Qwen3.5-397B-A17B-Channel-FP8 在 NMZ 环境下的 radix-cache 命中率矩阵。
+
+```bash
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --dry-run
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml --smoke --reuse-server
+python benchmark/run_ifb_matrix.py --config configs/ifb_matrix.yaml
+```
+
+详细说明见 `docs/ifb_sglang_matrix.md`。
+
 压测程序会对每个 case 至少 warmup 30 条请求，再正式测试。主要输出：
 
 ```text
