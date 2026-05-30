@@ -325,6 +325,67 @@ def normalize_metric(data: dict[str, Any], names: list[str]) -> Any:
     return ""
 
 
+def percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(v) for v in values)
+    pos = (len(ordered) - 1) * pct
+    lower = int(pos)
+    upper = min(lower + 1, len(ordered) - 1)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (pos - lower)
+
+
+def merge_detail_metrics(data: dict[str, Any]) -> dict[str, Any]:
+    ttfts = data.get("ttfts")
+    if isinstance(ttfts, list):
+        p90 = percentile(ttfts, 0.90)
+        if p90 is not None and "p90_ttft_ms" not in data:
+            data["p90_ttft_ms"] = p90 * 1000 if p90 < 100 else p90
+    return data
+
+
+def read_remote_json_summary(cfg: dict[str, Any], output_file: str) -> dict[str, Any]:
+    remote = cfg["remote"]["ssh_target"]
+    container = cfg["remote"]["docker_container"]
+    keys = [
+        "completed",
+        "total_input_tokens",
+        "total_output_tokens",
+        "request_throughput",
+        "output_throughput",
+        "total_throughput",
+        "mean_e2e_latency_ms",
+        "p90_e2e_latency_ms",
+        "p99_e2e_latency_ms",
+        "mean_ttft_ms",
+        "p90_ttft_ms",
+        "p99_ttft_ms",
+        "mean_tpot_ms",
+        "p90_tpot_ms",
+        "p99_tpot_ms",
+        "mean_itl_ms",
+        "p95_itl_ms",
+        "p99_itl_ms",
+        "ttfts",
+    ]
+    py = (
+        "import json;"
+        f"p={output_file!r};"
+        "obj=json.loads(open(p, encoding='utf-8').readline());"
+        f"keys={keys!r};"
+        "print(json.dumps({k: obj.get(k) for k in keys if k in obj}, ensure_ascii=False))"
+    )
+    result = docker_exec(remote, container, f"python -c {q(py)}", timeout=60, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+    try:
+        return merge_detail_metrics(json.loads(result.stdout.strip().splitlines()[-1]))
+    except json.JSONDecodeError:
+        return {}
+
+
 def run_one_bench(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate: float, concurrency: int) -> dict[str, Any]:
     remote = cfg["remote"]["ssh_target"]
     container = cfg["remote"]["docker_container"]
@@ -351,6 +412,8 @@ set -euo pipefail
     text = result.stdout + "\n" + result.stderr
     data = parse_jsonish(text)
     data.update({k: v for k, v in parse_text_metrics(text).items() if k not in data})
+    detail_data = read_remote_json_summary(cfg, output_file)
+    data.update({k: v for k, v in detail_data.items() if v not in (None, "")})
     row = {
         "tag": tag,
         "input_len": input_len,
@@ -368,7 +431,7 @@ set -euo pipefail
         "p99_tpot_ms": normalize_metric(data, ["p99_tpot_ms", "p99_tpot"]),
         "request_throughput": normalize_metric(data, ["request_throughput", "request_throughput_rps"]),
         "output_throughput": normalize_metric(data, ["output_throughput", "output_token_throughput"]),
-        "total_token_throughput": normalize_metric(data, ["total_token_throughput"]),
+        "total_token_throughput": normalize_metric(data, ["total_token_throughput", "total_throughput"]),
         "raw_summary": json.dumps(data, ensure_ascii=False),
     }
     row["sla_pass"] = sla_pass(cfg, row)
@@ -422,13 +485,23 @@ def write_reports(local_dir: Path, rows: list[dict[str, Any]]) -> None:
     logging.info("Wrote %s and %s", csv_path, html_path)
 
 
-def run_matrix(cfg: dict[str, Any], dry_run: bool, smoke: bool, reuse_server: bool) -> list[dict[str, Any]]:
+def read_existing_rows(local_dir: Path) -> list[dict[str, Any]]:
+    csv_path = local_dir / "result.csv"
+    if not csv_path.exists():
+        return []
+    with csv_path.open("r", newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def run_matrix(cfg: dict[str, Any], dry_run: bool, smoke: bool, reuse_server: bool, resume: bool) -> list[dict[str, Any]]:
     if smoke:
         cfg = copy.deepcopy(cfg)
         cfg["benchmark"]["num_prompts"] = 2
         cfg["benchmark"]["warmup_requests"] = 1
     ensure_remote_dirs(cfg)
-    rows: list[dict[str, Any]] = []
+    local_dir = ROOT_DIR / cfg["reports"]["local_dir"]
+    rows: list[dict[str, Any]] = read_existing_rows(local_dir) if resume else []
+    completed = {row.get("tag") for row in rows if str(row.get("returncode", "")) == "0"}
     pairs = cfg["benchmark"]["input_output_pairs"]
     hit_rates = [float(x) for x in cfg["benchmark"]["radix_cache_hit_rates"]]
     concurrencies = concurrency_values(cfg["benchmark"]["concurrency_scan"])
@@ -447,9 +520,13 @@ def run_matrix(cfg: dict[str, Any], dry_run: bool, smoke: bool, reuse_server: bo
         for pair in pairs:
             for hit_rate in hit_rates:
                 for concurrency in concurrencies:
+                    tag = f"in{int(pair['input_len'])}_out{int(pair['output_len'])}_hit{int(hit_rate * 100)}_bs{int(concurrency)}"
+                    if tag in completed:
+                        logging.info("Skipping completed %s", tag)
+                        continue
                     row = run_one_bench(cfg, int(pair["input_len"]), int(pair["output_len"]), hit_rate, int(concurrency))
                     rows.append(row)
-                    write_reports(ROOT_DIR / cfg["reports"]["local_dir"], rows)
+                    write_reports(local_dir, rows)
                     if cfg["benchmark"].get("stop_after_first_sla_failure", False) and not row["sla_pass"]:
                         logging.info("Stopping scan after SLA failure at %s", row["tag"])
                         break
@@ -466,6 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--smoke", action="store_true", help="Run only the first point to validate the flow.")
     parser.add_argument("--reuse-server", action="store_true", help="Reuse an already running SGLang server and do not stop it.")
+    parser.add_argument("--no-resume", action="store_true", help="Do not reuse existing local result.csv rows.")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
@@ -475,7 +553,7 @@ def main() -> int:
     setup_logging(args.verbose)
     try:
         cfg = load_config(Path(args.config))
-        rows = run_matrix(cfg, args.dry_run, args.smoke, args.reuse_server)
+        rows = run_matrix(cfg, args.dry_run, args.smoke, args.reuse_server, not args.no_resume)
         if rows:
             write_reports(ROOT_DIR / cfg["reports"]["local_dir"], rows)
         return 0
