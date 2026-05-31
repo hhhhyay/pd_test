@@ -57,6 +57,16 @@ def merge_server(base: dict[str, Any], layout: dict[str, Any]) -> dict[str, Any]
             "--num-continuous-decode-steps",
             "--cuda-graph-max-bs",
             "--cuda-graph-bs",
+            "--attention-backend",
+            "--prefill-attention-backend",
+            "--decode-attention-backend",
+            "--linear-attn-prefill-backend",
+            "--page-size",
+            "--chunked-prefill-size",
+            "--kv-cache-dtype",
+            "--moe-a2a-backend",
+            "--moe-runner-backend",
+            "--deepep-mode",
         }
         cleaned = []
         skip_next = False

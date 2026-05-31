@@ -12,14 +12,18 @@
 ```text
 configs/cases.yaml                  # 通用 normal / PD case 配置
 configs/ifb_matrix.yaml             # SGLang IFB 矩阵配置
+configs/sglang_ifb_tp8_formal.yaml  # Qwen3.5 397B IFB prefill/decode TP8 正式测试配置
+configs/sglang_ifb_layout_repair_smoke.yaml # TP/PP/CP/DP/EP/DeepEP 切分 smoke 配置
 deploy/vllm_pd.sh                   # vLLM normal / PD 部署入口
 deploy/sglang_pd.sh                 # SGLang normal / PD 部署入口
 deploy/cleanup.sh                   # 清理 case 进程
 benchmark/run_bench.py              # 通用部署、健康检查、压测入口
 benchmark/run_ifb_matrix.py         # SGLang IFB 远端矩阵压测入口
+benchmark/run_sglang_ifb_sweep.py   # SGLang IFB prefill/decode 吞吐与切分扫描入口
 benchmark/parse_logs.py             # 解析框架日志并生成报告
 docs/ifb_sglang_matrix.md           # IFB 矩阵测试说明
 docs/sglang_parallel_config_guide.md # SGLang 并行配置指南
+docs/qwen35_397b_sglang_ifb_prefill_decode_report.md # Qwen3.5 397B IFB prefill/decode 测试报告
 reports/                            # 本地报告输出
 logs/                               # 本地运行日志
 ```

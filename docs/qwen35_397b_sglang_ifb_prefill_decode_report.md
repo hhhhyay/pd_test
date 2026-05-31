@@ -121,28 +121,52 @@ python3 -m sglang.launch_server \
 - TP8 prefill 已不满足 `mean TTFT < 3s`，当前不能直接推导可用 PD 配比。
 - 需要优先找到 65536 输入长度下满足 SLA 的 prefill 切分方式，再做 P:D 配比。
 
-## 其他切分方式的 smoke 结果
+## 多切分方式 smoke 结果
 
-已用 8 卡做过多种切分方式 smoke，当前观察到的主要失败原因如下：
+补跑配置：`configs/sglang_ifb_layout_repair_smoke.yaml`  
+结果文件：`reports/sglang_ifb_layout_repair_smoke/sweep_result.csv`
 
-| 切分方式 | 现象 | 初步原因 |
+### 可完成请求的切分
+
+| 切分方式 | prefill target rr | actual RPS | mean TTFT ms | P99 TTFT ms | total token throughput | prefill SLA | decode mean TPOT ms | decode output throughput |
+|---|---:|---:|---:|---:|---:|:---:|---:|---:|
+| `tp8` | 4.0 | 3.763 | 2985.54 | 4754.25 | 15415.88 | 通过 | 46.82 | 942.85 |
+| `cp2_triton_tp8` | 2.0 | 2.160 | 1491.97 | 2907.52 | 8849.08 | 通过 | 57.08 | 477.74 |
+| `cp2_triton_tp8` | 3.0 | 2.577 | 3853.11 | 6771.76 | 10556.30 | 失败 | 57.08 | 477.74 |
+| `cp4_triton_tp8` | 2.0 | 2.029 | 3068.63 | 5094.37 | 8311.98 | 失败 | 52.12 | 540.61 |
+| `cp8_triton_tp8` | 2.0 | 1.489 | 8758.14 | 15850.45 | 6099.86 | 失败 | 50.41 | 553.55 |
+
+结论：
+
+- `tp8` 仍是当前可用切分里 prefill 吞吐最高的方案，SLA 内实际 RPS `3.763 req/s`。
+- 将 CP 从 FA3 改成 triton 后，`cp2/cp4/cp8` 都可以启动并完成请求，说明之前的 CP 启动失败主要来自 FA3 page attention 的 GQA head 约束。
+- CP 增大后 prefill 性能下降明显；`cp2` 在低负载下能通过 mean TTFT SLA，但吞吐只有 TP8 的约 `57%`，不是最优 prefill 配置。
+- CP 的 decode TPOT 可以满足 75ms，但输出吞吐也低于 TP8。
+
+### 启动或运行失败的切分
+
+| 切分方式 | 结果 | 关键原因 |
 |---|---|---|
-| `cp8_mf09_cg16` | 启动失败 | FA3/page attention 断言 `num_heads<=num_kv_heads*48` |
-| `tp8cp4_mf09_cg16` | 启动失败 | 同上，GQA/MQA 头数与 CP/FA3 组合不满足内核约束 |
-| `tp8cp2_mf09_cg16` | 可启动但 4096 prefill 不达标，65536 出现失败 | CP2 在该配置下吞吐低于 TP8，长输入有稳定性/显存风险 |
-| `ep8_aiter` | 启动失败 | `aiter_moe_fp8_w8a8` 找不到合适 backend |
-| `tp8cp2ep4_aiter_mf09_cg16` | 启动失败 | 显存不足，日志建议调整 `--mem-fraction-static` |
-| `deepep_ep8_aiter` | 启动失败 | scheduler 进程异常退出，疑似 DeepEP/当前后端组合不稳定 |
+| `pp8_no_spec` | 启动失败 | PP 切分加载 Qwen3.5 FP8 MoE 权重时报 `KeyError: model.layers.22.mlp.experts.w13_weight` |
+| `tp4pp2_no_spec` | 启动失败 | 同 PP 权重键问题，去掉 EAGLE 后仍复现 |
+| `dp2_tp4_attention` | 启动失败 | FA3 page attention 断言 `num_heads<=num_kv_heads*48` |
+| `cp2dp2_tp4_triton` | 运行期失败 | 请求进入后 `dp_attention.py` all_gather 报 `output tensor size must be equal to world_size times input tensor size` |
+| `ep8_auto` | 启动失败 | 当前 ROCm 路径提示没有可用 MoE 实现，要求启用 AITER MoE 并关闭 `SGLANG_USE_FP8_W8A8_MOE` |
+| `ep8_triton_moe` | 启动失败 | 同上，指定 `--moe-runner-backend triton` 仍无可用 MoE 实现 |
+| `cp2ep4_triton_tp8` | 启动失败 | 同 EP MoE 后端问题 |
+| `ep8_aiter` | 启动失败 | AITER 路线在该 MoE shape 下报 `[aiter_moe_fp8_w8a8] no suitable backend found` |
+| `deepep_ep8_triton` | 启动失败 | DeepEP 启动阶段 scheduler 异常退出 |
 
-下一步建议：
+说明：
 
-- CP 类配置改用非 FA3 attention backend 或调整 page/head 参数后重试。
-- EP/DeepEP 类配置先确认当前 SGLang 版本和 AITER kernel 对 Qwen3.5-397B FP8 MoE shape 的支持。
-- PP 配置需要单独补跑；该模型的层切分和 FP8/MoE 权重加载方式可能与 TP-only 有差异，不能直接套用 TP8 参数。
+- 模型 config 显示 `num_attention_heads=32`、`num_key_value_heads=2`，GQA 比例很高；FA3/page attention 对 `qheads*mtp/kvheads` 有约束，因此 CP/DP attention 组合容易触发断言。
+- PP 失败与 speculative 无关；`pp8_no_spec`、`tp4pp2_no_spec` 均复现同一权重键错误，更像当前 SGLang 版本对该 FP8 MoE checkpoint 的 PP 权重加载映射不兼容。
+- EP/DeepEP 失败集中在 ROCm MoE kernel 支持上；默认/ triton 路线提示无可用实现，AITER 路线又无法覆盖该专家矩阵 shape。
 
 ## 当前结论
 
 1. 在 8 卡 TP8 IFB、关闭 radix-cache 条件下，`4096 -> 1` prefill 的 SLA 内最优点为实际 `3.763 req/s`，总吞吐 `15415.88 token/s`。
-2. `65536 -> 1` 在 TP8 IFB 下不满足 `mean TTFT < 3s`，需要换 PP/CP 或其他长上下文切分继续优化。
+2. `65536 -> 1` 在 TP8 IFB 下不满足 `mean TTFT < 3s`；已尝试 PP/CP/EP/DP/CPDP/CPEP/DeepEP，其中只有 CP 能完成请求，但 4096 prefill 吞吐已低于 TP8，尚未找到能解决 65536 TTFT 的更优切分。
 3. Decode `1 -> 1024` 的最优点约为 `mc=192`，mean TPOT `46.82ms`，P99 TPOT `65.98ms`，output throughput `942.85 token/s`。
 4. 对 `4096 -> 1024`，若按同等 TP8 实例做 PD 分离，估算需要约 `1P:4D` 才能让 decode 不成为瓶颈；两节点 `1P1D` 时应将入口 RPS 控制在约 `0.9 req/s` 级别。
+5. 当前环境下推荐的 IFB baseline 是 `tp8`；CP2 可作为可启动对照，但不作为最优方案。PP、EP、DeepEP 需要先修复框架/内核兼容性，再进入性能比较。
