@@ -141,7 +141,6 @@ python3 -m sglang.launch_server \
 - `tp8` 仍是当前可用切分里 prefill 吞吐最高的方案，SLA 内实际 RPS `3.763 req/s`。
 - 将 CP 从 FA3 改成 triton 后，`cp2/cp4/cp8` 都可以启动并完成请求，说明之前的 CP 启动失败主要来自 FA3 page attention 的 GQA head 约束。
 - 注意：base TP8 配置保留 `SGLANG_KV_LAYOUT_DCU_FA=1` 和 `--attention-backend fa3`；CP smoke 配置会通过 `env_overrides` 将 `SGLANG_KV_LAYOUT_DCU_FA=0`，并替换为 `--attention-backend triton`。
-- 若 CP/DP/EP smoke 启动时报 `AssertionError: capture_bs=[0]`，这是 cuda graph capture batch size 解析为 0 导致的启动期断言；`layout_repair_smoke` 配置已改为禁用 cuda graph/piecewise graph，先验证切分稳定性，正式性能测试再单独打开 graph 调优。
 - CP 增大后 prefill 性能下降明显；`cp2` 在低负载下能通过 mean TTFT SLA，但吞吐只有 TP8 的约 `57%`，不是最优 prefill 配置。
 - CP 的 decode TPOT 可以满足 75ms，但输出吞吐也低于 TP8。
 

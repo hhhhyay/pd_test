@@ -68,8 +68,7 @@ server_base:
     - "36000"
     - --kv-cache-dtype
     - fp8_e4m3
-    - --disable-cuda-graph
-    - --disable-piecewise-cuda-graph
+    - --enable-piecewise-cuda-graph
     - --speculative-algorithm
     - EAGLE
     - --speculative-num-steps
