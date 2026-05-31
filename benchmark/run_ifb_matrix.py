@@ -44,6 +44,8 @@ def join_shell_args(args: list[Any]) -> str:
     for arg in args:
         if arg == "__AUTO_HOST_IP__":
             rendered.append("$(hostname -I | awk '{print $1}')")
+        elif arg == "__HOSTNAME_I__":
+            rendered.append("$(hostname -i)")
         else:
             rendered.append(q(arg))
     return " ".join(rendered)
@@ -152,6 +154,8 @@ def server_command(cfg: dict[str, Any]) -> str:
     host = remote_cfg.get("host", "0.0.0.0")
     if host == "auto_ip":
         host = "__AUTO_HOST_IP__"
+    elif host == "hostname_i":
+        host = "__HOSTNAME_I__"
     args = [
         "python3",
         "-m",
@@ -173,8 +177,11 @@ def server_command(cfg: dict[str, Any]) -> str:
     ]
     optional_parallel = [
         ("atten_cp_size", "--attention-context-parallel-size"),
-        ("ep_size", "--moe-data-parallel-size"),
+        ("ep_size", "--expert-parallel-size"),
+        ("expert_parallel_size", "--expert-parallel-size"),
+        ("moe_dp_size", "--moe-data-parallel-size"),
         ("dp_size", "--data-parallel-size"),
+        ("moe_dense_tp_size", "--moe-dense-tp-size"),
     ]
     for key, flag in optional_parallel:
         value = server.get(key)
@@ -186,6 +193,9 @@ def server_command(cfg: dict[str, Any]) -> str:
     max_total_tokens = server.get("max_total_tokens")
     if max_total_tokens not in (None, "", "null"):
         args.extend(["--max-total-tokens", str(max_total_tokens)])
+    max_prefill_tokens = server.get("max_prefill_tokens")
+    if max_prefill_tokens not in (None, "", "null"):
+        args.extend(["--max-prefill-tokens", str(max_prefill_tokens)])
     quant = server.get("quantization")
     if quant:
         args.extend(["--quantization", str(quant)])
@@ -252,6 +262,7 @@ def bench_command(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
     prompts = int(bench.get("num_prompts", 256))
     group_size = max(prompts, concurrency, 1)
     backend = bench.get("backend", "sglang-oai-chat")
+    dataset_name = bench.get("dataset_name", "generated-shared-prefix")
     served_model_name = server.get("served_model_name", server.get("model_name", server["model_path"]))
     model_arg = server["model_path"] if backend == "sglang" else served_model_name
     args = [
@@ -271,7 +282,7 @@ def bench_command(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
         "--tokenizer",
         server.get("tokenizer_path", server["model_path"]),
         "--dataset-name",
-        bench.get("dataset_name", "generated-shared-prefix"),
+        dataset_name,
         "--num-prompts",
         str(prompts),
         "--request-rate",
@@ -280,23 +291,39 @@ def bench_command(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
         str(concurrency),
         "--warmup-requests",
         str(int(bench.get("warmup_requests", 30))),
-        "--gsp-num-groups",
-        "1",
-        "--gsp-prompts-per-group",
-        str(group_size),
-        "--gsp-system-prompt-len",
-        str(shared_len),
-        "--gsp-question-len",
-        str(question_len),
-        "--gsp-output-len",
-        str(output_len),
-        "--gsp-range-ratio",
-        str(bench.get("random_range_ratio", 1.0)),
         "--output-file",
         output_file,
         "--output-details",
         "--disable-tqdm",
     ]
+    if dataset_name == "generated-shared-prefix":
+        args.extend(
+            [
+                "--gsp-num-groups",
+                "1",
+                "--gsp-prompts-per-group",
+                str(group_size),
+                "--gsp-system-prompt-len",
+                str(shared_len),
+                "--gsp-question-len",
+                str(question_len),
+                "--gsp-output-len",
+                str(output_len),
+                "--gsp-range-ratio",
+                str(bench.get("random_range_ratio", 1.0)),
+            ]
+        )
+    elif dataset_name in ("random", "random-ids"):
+        args.extend(
+            [
+                "--random-input-len",
+                str(input_len),
+                "--random-output-len",
+                str(output_len),
+                "--random-range-ratio",
+                str(bench.get("random_range_ratio", 1.0)),
+            ]
+        )
     if bench.get("gsp_fast_prepare", False):
         args.append("--gsp-fast-prepare")
     if bench.get("tokenize_prompt", False):
@@ -373,7 +400,8 @@ def server_log_line_count(cfg: dict[str, Any]) -> int:
     remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
-    result = docker_exec(remote, container, f"wc -l < {q(remote_dir)}/logs/server.log", timeout=60, check=False)
+    server_log = cfg["reports"].get("server_log_path", f"{remote_dir}/logs/server.log")
+    result = docker_exec(remote, container, f"wc -l < {q(server_log)}", timeout=60, check=False)
     if result.returncode != 0:
         return 0
     try:
@@ -386,10 +414,11 @@ def capture_server_cache_log(cfg: dict[str, Any], tag: str, start_line: int) -> 
     remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     remote_dir = cfg["reports"]["remote_dir"]
+    server_log = cfg["reports"].get("server_log_path", f"{remote_dir}/logs/server.log")
     excerpt_file = f"{remote_dir}/logs/{tag}.server_cache.log"
     from_line = max(start_line + 1, 1)
     cmd = (
-        f"tail -n +{from_line} {q(remote_dir)}/logs/server.log | "
+        f"tail -n +{from_line} {q(server_log)} | "
         "grep -Ei 'Prefill batch|cached-token|new-token|radix|prefix|cache hit|hit rate' "
         f"> {q(excerpt_file)} || true"
     )
@@ -442,18 +471,12 @@ def read_remote_json_summary(cfg: dict[str, Any], output_file: str) -> dict[str,
         "p99_itl_ms",
         "ttfts",
     ]
-    py = (
-        "import json;"
-        f"p={output_file!r};"
-        "obj=json.loads(open(p, encoding='utf-8').readline());"
-        f"keys={keys!r};"
-        "print(json.dumps({k: obj.get(k) for k in keys if k in obj}, ensure_ascii=False))"
-    )
-    result = docker_exec(remote, container, f"python -c {q(py)}", timeout=60, check=False)
+    result = docker_exec(remote, container, f"tail -n 1 {q(output_file)}", timeout=60, check=False)
     if result.returncode != 0 or not result.stdout.strip():
         return {}
     try:
-        return merge_detail_metrics(json.loads(result.stdout.strip().splitlines()[-1]))
+        obj = json.loads(result.stdout.strip().splitlines()[-1])
+        return merge_detail_metrics({k: obj.get(k) for k in keys if k in obj})
     except json.JSONDecodeError:
         return {}
 
@@ -469,7 +492,7 @@ def run_one_bench(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
     prompts = int(cfg["benchmark"].get("num_prompts", 256))
     group_size = max(prompts, concurrency, 1)
     clear_cache = ""
-    if cfg["benchmark"].get("clear_gsp_cache", False):
+    if cfg["benchmark"].get("clear_gsp_cache", False) and cfg["benchmark"].get("dataset_name", "generated-shared-prefix") == "generated-shared-prefix":
         clear_cache = (
             "rm -f "
             f"/root/.cache/sglang/benchmark/gen_shared_prefix_*_1_{group_size}_{shared_len}_{question_len}_{output_len}_*.pkl\n"
@@ -477,6 +500,7 @@ def run_one_bench(cfg: dict[str, Any], input_len: int, output_len: int, hit_rate
     cmd = f"""
 set -euo pipefail
 {clear_cache}
+rm -f {q(output_file)}
 {bench_command(cfg, input_len, output_len, hit_rate, concurrency, output_file)} > {q(log_file)} 2>&1
 tail -200 {q(log_file)}
 """
@@ -533,7 +557,12 @@ def sla_pass(cfg: dict[str, Any], row: dict[str, Any]) -> bool:
     sla = cfg["benchmark"].get("sla", {})
     mean_ttft_ms = as_float(row.get("mean_ttft_ms"))
     mean_tpot_ms = as_float(row.get("mean_tpot_ms"))
-    if math.isnan(mean_ttft_ms) or math.isnan(mean_tpot_ms):
+    output_len = int(row.get("output_len") or 0)
+    if math.isnan(mean_ttft_ms):
+        return False
+    if output_len <= 1 and math.isnan(mean_tpot_ms):
+        return mean_ttft_ms < float(sla.get("mean_ttft_s_lt", 10)) * 1000
+    if math.isnan(mean_tpot_ms):
         return False
     return mean_ttft_ms < float(sla.get("mean_ttft_s_lt", 10)) * 1000 and mean_tpot_ms < float(sla.get("mean_tpot_ms_lt", 75))
 

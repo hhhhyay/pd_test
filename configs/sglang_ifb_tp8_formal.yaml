@@ -1,0 +1,135 @@
+remote:
+  ssh_target: guobj@10.16.1.36
+  docker_container: gbj_sgl0522
+  workdir: /mnt11/task/sgl
+  host: hostname_i
+  client_host: 10.16.1.36
+  port: 30005
+
+server_base:
+  framework: sglang
+  mode: ifb
+  model_name: Qwen3.5-397B-A17B-Channel-FP8
+  model_path: /model/qwen3.5/Qwen3.5-397B-A17B-Channel-FP8
+  tokenizer_path: /model/qwen3.5/Qwen3.5-397B-A17B-Channel-FP8
+  served_model_name: qwen3-397-fp8
+  tp_size: 8
+  pp_size: 1
+  dp_size: null
+  ep_size: null
+  atten_cp_size: null
+  moe_dp_size: null
+  moe_dense_tp_size: null
+  quantization: null
+  max_running_requests: null
+  max_total_tokens: null
+  max_prefill_tokens: null
+  mem_fraction_static: 0.82
+  enable_radix_cache: false
+  env:
+    NCCL_MIN_NCHANNELS: "16"
+    NCCL_MAX_NCHANNELS: "16"
+    SGLANG_ENABLE_SPEC_V2: "1"
+    SGLANG_TORCH_PROFILER_DIR: /home/proj_qwen3.5-397b/profiling
+    HSA_ENABLE_COREDUMP: "1"
+    USE_DCU_CUSTOM_ALLREDUCE: "1"
+    ALLREDUCE_STREAM_WITH_COMPUTE: "1"
+    HIP_KERNEL_EVENT_SYSTENFENCE: "1"
+    SGL_CHUNKED_PREFIX_CACHE_THRESHOLD: "0"
+    GLIBC_TUNABLES: glibc.rtld.optional_static_tls=0x40000
+    HIP_KERNEL_BATCH_CEILING: "100"
+    GPU_FORCE_BLIT_COPY_SIZE: "16"
+    HSA_KERNARG_POOL_SIZE: "8388608"
+    ROC_AQL_QUEUE_SIZE: "131072"
+    SGLANG_USE_LIGHTOP: "1"
+    SGLANG_USE_FP8_W8A8_MOE: "1"
+    SGLANG_USE_FUSED_TOPK_SOFTMAX: "1"
+    SGLANG_USE_CAUSAL_CONV1D: "1"
+    SGLANG_KV_LAYOUT_DCU_FA: "1"
+    SGLANG_USE_AITER_LINEAR_ATTN: "1"
+  extra_args:
+    - --numa-node
+    - "0"
+    - "0"
+    - "0"
+    - "0"
+    - "1"
+    - "1"
+    - "1"
+    - "1"
+    - --trust-remote-code
+    - --dtype
+    - bfloat16
+    - --attention-backend
+    - fa3
+    - --page-size
+    - "64"
+    - --watchdog-timeout
+    - "36000"
+    - --kv-cache-dtype
+    - fp8_e4m3
+    - --enable-piecewise-cuda-graph
+    - --speculative-algorithm
+    - EAGLE
+    - --speculative-num-steps
+    - "3"
+    - --speculative-eagle-topk
+    - "1"
+    - --speculative-num-draft-tokens
+    - "4"
+    - --chunked-prefill-size
+    - "-1"
+    - --skip-server-warmup
+    - --cuda-graph-max-bs
+    - "32"
+    - --decode-log-interval
+    - "20"
+
+layouts:
+  - name: tp8
+    server_overrides:
+      tp_size: 8
+      pp_size: 1
+
+benchmark:
+  backend: sglang-oai
+  dataset_name: random
+  random_range_ratio: 1.0
+  num_prompts: 128
+  warmup_requests: 30
+  ready_timeout_s: 1800
+  bench_timeout_s: 1200
+  cooldown_s: 3
+  sla:
+    mean_ttft_s_lt: 3
+    mean_tpot_ms_lt: 75
+
+workloads:
+  - name: prefill_4096_formal
+    phase: prefill
+    input_len: 4096
+    output_len: 1
+    max_concurrency: 512
+    num_prompts: 160
+    warmup_requests: 30
+    request_rates: [3.5, 3.75, 4.0, 4.25, 4.5, 5.0]
+  - name: prefill_65536_formal
+    phase: prefill
+    input_len: 65536
+    output_len: 1
+    max_concurrency: 512
+    num_prompts: 8
+    warmup_requests: 2
+    request_rates: [0.05, 0.1, 0.2]
+  - name: decode_1_1024_formal
+    phase: decode
+    input_len: 1
+    output_len: 1024
+    max_concurrency_values: [128, 192, 256, 384, 512]
+    num_prompts: 128
+    warmup_requests: 8
+    request_rates: [.inf]
+
+reports:
+  local_dir: reports/sglang_ifb_tp8_formal
+  remote_dir: /mnt11/task/sgl/pd_test_runs/sglang_ifb_tp8_formal
