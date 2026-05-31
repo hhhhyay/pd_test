@@ -214,16 +214,30 @@ def server_env_prefix(cfg: dict[str, Any]) -> str:
     return " ".join(f"export {key}={q(value)};" for key, value in env.items())
 
 
+def server_env_dump(cfg: dict[str, Any]) -> str:
+    env = cfg["server"].get("env", {})
+    return "\n".join(f"{key}={value}" for key, value in sorted(env.items()))
+
+
 def start_server(cfg: dict[str, Any]) -> None:
     remote = remote_target(cfg)
     container = cfg["remote"]["docker_container"]
     workdir = cfg["remote"]["workdir"]
     remote_dir = cfg["reports"]["remote_dir"]
+    launch_cmd = server_command(cfg)
     cmd = f"""
 set -euo pipefail
 cd {q(workdir)}
+mkdir -p {q(remote_dir)}/logs
+cat > {q(remote_dir)}/logs/launch_env.txt <<'EOF'
+{server_env_dump(cfg)}
+EOF
+cat > {q(remote_dir)}/logs/launch_cmd.sh <<'EOF'
 {server_env_prefix(cfg)}
-nohup {server_command(cfg)} > {q(remote_dir)}/logs/server.log 2>&1 &
+{launch_cmd}
+EOF
+{server_env_prefix(cfg)}
+nohup {launch_cmd} > {q(remote_dir)}/logs/server.log 2>&1 &
 echo "$!" > {q(remote_dir)}/server.pid
 """
     docker_exec(remote, container, cmd)
