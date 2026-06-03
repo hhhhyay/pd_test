@@ -91,10 +91,14 @@ layouts:
     server_overrides: {tp_size: 8, pp_size: 1}
   - name: pp8
     server_overrides: {tp_size: 1, pp_size: 8}
-    env_overrides: {SGLANG_PP_LAYER_PARTITION: "8,8,8,8,8,8,8,8"}
+    env_overrides: {SGLANG_PP_LAYER_PARTITION: "10,10,10,10,10,10,9,9", SGLANG_ENABLE_SPEC_V2: "0"}
+    extra_args_remove_flags: [--speculative-algorithm, --speculative-num-steps, --speculative-eagle-topk, --speculative-num-draft-tokens]
+    extra_args_append: [--disable-overlap-schedule]
   - name: tp4pp2
     server_overrides: {tp_size: 4, pp_size: 2}
-    env_overrides: {SGLANG_PP_LAYER_PARTITION: "32,32"}
+    env_overrides: {SGLANG_PP_LAYER_PARTITION: "39,39", SGLANG_ENABLE_SPEC_V2: "0"}
+    extra_args_remove_flags: [--speculative-algorithm, --speculative-num-steps, --speculative-eagle-topk, --speculative-num-draft-tokens]
+    extra_args_append: [--disable-overlap-schedule]
   - name: tp8cp8
     server_overrides: {tp_size: 8, pp_size: 1, atten_cp_size: 8}
     extra_args_append: [--enable-nsa-prefill-context-parallel, --nsa-prefill-cp-mode, round-robin-split]
