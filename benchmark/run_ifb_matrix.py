@@ -87,7 +87,21 @@ def ssh(remote: str, command: str, timeout: int | None = None, check: bool = Tru
         ]
         command = " ".join(q(x) for x in nested_cmd)
         remote = outer
-    return run_local(["ssh", "-o", "BatchMode=yes", remote, command], timeout=timeout, check=check)
+    return run_local(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=NUL",
+            remote,
+            command,
+        ],
+        timeout=timeout,
+        check=check,
+    )
 
 
 def docker_exec(remote: str, container: str | None, command: str, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:

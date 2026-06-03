@@ -118,7 +118,7 @@ layouts:
 
 benchmark:
   backend: sglang-oai
-  dataset_name: random
+  dataset_name: random-ids
   random_range_ratio: 1.0
   num_prompts: 256
   warmup_requests: 30

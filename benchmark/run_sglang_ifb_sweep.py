@@ -40,6 +40,20 @@ def selected(items: list[dict[str, Any]], names: set[str] | None) -> list[dict[s
     return [item for item in items if item["name"] in names]
 
 
+def percentile(values: list[Any], pct: float) -> float | None:
+    nums = sorted(x for x in (to_float(v) for v in values) if not math.isnan(x))
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return nums[0]
+    rank = (len(nums) - 1) * pct / 100
+    low = math.floor(rank)
+    high = math.ceil(rank)
+    if low == high:
+        return nums[int(rank)]
+    return nums[low] * (high - rank) + nums[high] * (rank - low)
+
+
 def merge_server(base: dict[str, Any], layout: dict[str, Any]) -> dict[str, Any]:
     server = copy.deepcopy(base)
     for key, value in layout.get("server_overrides", {}).items():
@@ -252,6 +266,21 @@ tail -200 {q(log_file)}
     data = parse_jsonish(text)
     data.update({k: v for k, v in parse_text_metrics(text).items() if k not in data})
     data.update({k: v for k, v in read_remote_json_summary(cfg, output_file).items() if v not in (None, "")})
+    ttfts = data.get("ttfts")
+    if isinstance(ttfts, list):
+        for key, pct in (("p90_ttft_ms", 90), ("p99_ttft_ms", 99)):
+            if data.get(key) in (None, ""):
+                value = percentile([x * 1000 for x in ttfts], pct)
+                if value is not None:
+                    data[key] = value
+    itls = data.get("itls")
+    if isinstance(itls, list):
+        flat_itls = [x * 1000 for seq in itls if isinstance(seq, list) for x in seq]
+        for key, pct in (("p95_itl_ms", 95), ("p99_itl_ms", 99)):
+            if data.get(key) in (None, ""):
+                value = percentile(flat_itls, pct)
+                if value is not None:
+                    data[key] = value
     server_excerpt = capture_server_excerpt(cfg, tag, server_start_line)
     data.update({k: v for k, v in summarize_server_excerpt(cfg, server_excerpt).items() if v not in (None, "")})
     output_tps = to_float(data.get("output_throughput"))
@@ -281,7 +310,7 @@ tail -200 {q(log_file)}
         "input_throughput": data.get("input_throughput", ""),
         "output_throughput": data.get("output_throughput", ""),
         "total_token_throughput": data.get("total_token_throughput", data.get("total_throughput", "")),
-        "decode_req_capacity_at_75ms": (output_tps / (1000 / 75) if not math.isnan(output_tps) else ""),
+        "decode_req_capacity_at_50ms": (output_tps / (1000 / 50) if not math.isnan(output_tps) else ""),
         "server_prefill_input_tps_avg": data.get("server_prefill_input_tps_avg", ""),
         "server_prefill_input_tps_max": data.get("server_prefill_input_tps_max", ""),
         "server_decode_gen_tps_avg": data.get("server_decode_gen_tps_avg", ""),
@@ -471,6 +500,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workloads", help="Comma-separated workload names to run.")
     parser.add_argument("--request-rates", help="Comma-separated request rates overriding workload config.")
     parser.add_argument("--max-concurrency-values", help="Comma-separated max-concurrency values overriding workload config.")
+    parser.add_argument("--ssh-target", help="Override remote.ssh_target from the config.")
+    parser.add_argument("--docker-container", help="Override remote.docker_container from the config. Use 'host' for bare-metal SSH execution.")
+    parser.add_argument("--client-host", help="Override remote.client_host from the config.")
+    parser.add_argument("--num-prompts", type=int, help="Override benchmark num_prompts for quick smoke runs.")
+    parser.add_argument("--warmup-requests", type=int, help="Override benchmark warmup_requests for quick smoke runs.")
     parser.add_argument("--reuse-server", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -483,6 +517,28 @@ def main() -> int:
     args = parse_args()
     setup_logging(args.verbose)
     try:
+        if args.ssh_target or args.docker_container or args.client_host or args.num_prompts is not None or args.warmup_requests is not None:
+            cfg = load_config(Path(args.config))
+            if args.ssh_target:
+                cfg["remote"]["ssh_target"] = args.ssh_target
+            if args.docker_container:
+                cfg["remote"]["docker_container"] = args.docker_container
+            if args.client_host:
+                cfg["remote"]["client_host"] = args.client_host
+            if args.num_prompts is not None:
+                cfg["benchmark"]["num_prompts"] = args.num_prompts
+                for workload in cfg.get("workloads", []):
+                    workload["num_prompts"] = args.num_prompts
+            if args.warmup_requests is not None:
+                cfg["benchmark"]["warmup_requests"] = args.warmup_requests
+                for workload in cfg.get("workloads", []):
+                    workload["warmup_requests"] = args.warmup_requests
+            tmp = ROOT_DIR / "logs" / "runtime_config.yaml"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            import yaml
+
+            tmp.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+            args.config = str(tmp)
         return run(args)
     except KeyboardInterrupt:
         logging.warning("Interrupted")
