@@ -171,6 +171,45 @@ docs/sglang_parallel_config_guide.md
 - 如何映射到本工程的 `tp_size`、`pp_size`、`dp_size`、`ep_size`、`atten_cp_size` 和 `extra_args`
 - 全量测试前的检查清单
 
+## GLM5-INT8 IFB / PD 测试
+
+GLM5-INT8 测试按 prefill 和 decode 两个口径拆分：
+
+```bash
+# prefill：关闭 radix-cache，output_len=1，max_concurrency=256，通过 request-rate 找 mean TTFT < 30s 的实际 Request throughput
+python benchmark/run_sglang_ifb_sweep.py --config configs/glm5_int8_ifb_prefill_sweep.yaml --layouts tp8,tp8cp8,tp8ep8,deepep_tp8ep8 --no-resume
+
+# decode：开启 radix-cache，generated-shared-prefix 构造 99% 命中率，request-rate=inf，通过 max_concurrency 扫描 mean TPOT < 50ms 的容量
+python benchmark/run_sglang_ifb_sweep.py --config configs/glm5_int8_ifb_decode_cache99_sweep.yaml --layouts tp8,tp8cp8,tp8ep8,deepep_tp8ep8 --no-resume
+```
+
+完整 layout 覆盖 `tp8`、`pp8`、`tp4pp2`、`tp8cp8`、`cp4_tp8`、`dp2_tp4_moe`、`tp8ep8`、`deepep_tp8ep8`。连接到 `10.16.1.20` 后，在 `/mnt11/task/sgl/` 下运行；若目标环境为裸机执行，配置里的 `docker_container: null` 会让 runner 直接通过 SSH 执行命令。
+
+PD 分离启动脚本：
+
+```bash
+# P 节点
+bash deploy/sglang_glm5_pd.sh prefill <master_ip> 0 tp8cp8
+
+# D 节点
+bash deploy/sglang_glm5_pd.sh decode <master_ip> 0 deepep
+
+# Router
+DECODE_URL=http://<decode_ip>:30000 bash deploy/sglang_glm5_pd.sh router <prefill_ip>
+
+# 清理
+bash deploy/sglang_glm5_pd.sh cleanup <master_ip>
+```
+
+结果目录：
+
+```text
+reports/glm5_int8_ifb_prefill_sweep
+reports/glm5_int8_ifb_decode_cache99_sweep
+/mnt11/task/sgl/pd_test_runs/glm5_int8_ifb_prefill_sweep
+/mnt11/task/sgl/pd_test_runs/glm5_int8_ifb_decode_cache99_sweep
+```
+
 ## 指标说明
 
 压测程序记录的核心指标：

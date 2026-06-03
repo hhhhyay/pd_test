@@ -1,0 +1,152 @@
+remote:
+  ssh_target: guobj@10.16.1.20
+  docker_container: null
+  workdir: /mnt11/task/sgl
+  host: hostname_i
+  client_host: 10.16.1.20
+  port: 30000
+
+server_base:
+  framework: sglang
+  mode: ifb
+  model_name: GLM-5-W8A8
+  model_path: /model/vllm-w8a8-models/GLM-5-W8A8
+  tokenizer_path: /model/vllm-w8a8-models/GLM-5-W8A8
+  served_model_name: glm5-int8
+  tp_size: 8
+  pp_size: 1
+  dp_size: null
+  ep_size: null
+  atten_cp_size: null
+  moe_dense_tp_size: null
+  quantization: slimquant_marlin
+  max_running_requests: 512
+  max_total_tokens: null
+  max_prefill_tokens: null
+  mem_fraction_static: 0.90
+  enable_radix_cache: false
+  env:
+    NCCL_MIN_NCHANNELS: "16"
+    NCCL_MAX_NCHANNELS: "16"
+    SGLANG_ENABLE_SPEC_V2: "1"
+    HSA_ENABLE_COREDUMP: "1"
+    USE_DCU_CUSTOM_ALLREDUCE: "1"
+    ALLREDUCE_STREAM_WITH_COMPUTE: "1"
+    HIP_KERNEL_EVENT_SYSTENFENCE: "1"
+    SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD: "0"
+    GLIBC_TUNABLES: glibc.rtld.optional_static_tls=0x40000
+    HIP_KERNEL_BATCH_CEILING: "100"
+    GPU_FORCE_BLIT_COPY_SIZE: "16"
+    HSA_KERNARG_POOL_SIZE: "8388608"
+    ROC_AQL_QUEUE_SIZE: "131072"
+    SGLANG_USE_LIGHTOP: "1"
+    W8A8_SUPPORT_METHODS: "3"
+    SGLANG_KVALLOC_KERNEL: "1"
+    SGLANG_CREATE_EXTEND_AFTER_DECODE_SPEC_INFO: "1"
+    SGLANG_ASSIGN_EXTEND_CACHE_LOCS: "1"
+    SGLANG_ASSIGN_REQ_TO_TOKEN_POOL: "1"
+    SGLANG_GET_LAST_LOC: "1"
+    SGLANG_CREATE_FLASHMLA_KV_INDICES_TRITON: "1"
+    SGLANG_CREATE_CHUNKED_PREFIX_CACHE_KV_INDICES: "1"
+    HIP_GRAPH_ACCUMULATE_DISPATCH: "1"
+    HIP_GRAPH_USE_CMD_CACHE: "0"
+    ROCBLAS_TENSILE_LIBPATH: /mnt11/nmz/sgl/auto_select_tools/optimization_configs/new/config/library_gpu6
+    HIPBLASLT_TUNING_OVERRIDE_FILE: hipblaslt.config
+  extra_args:
+    - --trust-remote-code
+    - --dtype
+    - bfloat16
+    - --kv-cache-dtype
+    - fp8_e4m3
+    - --page-size
+    - "64"
+    - --nsa-prefill-backend
+    - flashmla_auto
+    - --nsa-decode-backend
+    - flashmla_kv
+    - --context-length
+    - "131072"
+    - --dist-timeout
+    - "10000"
+    - --watchdog-timeout
+    - "3600"
+    - --chunked-prefill-size
+    - "-1"
+    - --cuda-graph-max-bs
+    - "32"
+    - --speculative-algorithm
+    - EAGLE
+    - --speculative-num-steps
+    - "3"
+    - --speculative-eagle-topk
+    - "1"
+    - --speculative-num-draft-tokens
+    - "4"
+    - --skip-server-warmup
+    - --decode-log-interval
+    - "20"
+
+layouts:
+  - name: tp8
+    server_overrides: {tp_size: 8, pp_size: 1}
+  - name: pp8
+    server_overrides: {tp_size: 1, pp_size: 8}
+    env_overrides: {SGLANG_PP_LAYER_PARTITION: "8,8,8,8,8,8,8,8"}
+  - name: tp4pp2
+    server_overrides: {tp_size: 4, pp_size: 2}
+    env_overrides: {SGLANG_PP_LAYER_PARTITION: "32,32"}
+  - name: tp8cp8
+    server_overrides: {tp_size: 8, pp_size: 1, atten_cp_size: 8}
+    extra_args_append: [--enable-nsa-prefill-context-parallel, --nsa-prefill-cp-mode, round-robin-split]
+  - name: cp4_tp8
+    server_overrides: {tp_size: 8, pp_size: 1, atten_cp_size: 4}
+    extra_args_append: [--enable-nsa-prefill-context-parallel, --nsa-prefill-cp-mode, round-robin-split]
+  - name: dp2_tp4_moe
+    server_overrides: {tp_size: 4, pp_size: 1, dp_size: 2, moe_dense_tp_size: 1}
+    extra_args_append: [--enable-dp-attention, --enable-dp-lm-head]
+  - name: tp8ep8
+    server_overrides: {tp_size: 8, pp_size: 1, ep_size: 8, moe_dense_tp_size: 1}
+  - name: deepep_tp8ep8
+    server_overrides: {tp_size: 8, pp_size: 1, ep_size: 8, moe_dense_tp_size: 1}
+    env_overrides:
+      ROCSHMEM_DISABLE_HDP_FLUSH: "1"
+      ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX: "288"
+      ROCSHMEM_HEAP_SIZE: "3173741824"
+      SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK: "128"
+      ROCSHMEM_ALLOWED_IBV_DEVICES: mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+    extra_args_append: [--moe-a2a-backend, deepep, --deepep-mode, low_latency, --enable-dp-lm-head]
+
+benchmark:
+  backend: sglang-oai
+  dataset_name: random
+  random_range_ratio: 1.0
+  num_prompts: 256
+  warmup_requests: 30
+  ready_timeout_s: 1800
+  bench_timeout_s: 1800
+  cooldown_s: 5
+  sla:
+    mean_ttft_s_lt: 30
+    mean_tpot_ms_lt: 50
+
+workloads:
+  - name: prefill_4096
+    phase: prefill
+    input_len: 4096
+    output_len: 1
+    max_concurrency: 256
+    num_prompts: 320
+    warmup_requests: 30
+    request_rates: [1, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32]
+  - name: prefill_65536
+    phase: prefill
+    input_len: 65536
+    output_len: 1
+    max_concurrency: 256
+    num_prompts: 96
+    warmup_requests: 8
+    request_rates: [0.05, 0.1, 0.2, 0.4, 0.6, 0.8, 1.0, 1.5, 2.0]
+
+reports:
+  local_dir: reports/glm5_int8_ifb_prefill_sweep
+  remote_dir: /mnt11/task/sgl/pd_test_runs/glm5_int8_ifb_prefill_sweep

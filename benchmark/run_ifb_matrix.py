@@ -90,7 +90,9 @@ def ssh(remote: str, command: str, timeout: int | None = None, check: bool = Tru
     return run_local(["ssh", "-o", "BatchMode=yes", remote, command], timeout=timeout, check=check)
 
 
-def docker_exec(remote: str, container: str, command: str, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+def docker_exec(remote: str, container: str | None, command: str, timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    if container in (None, "", "null", "none", "host"):
+        return ssh(remote, f"bash -lc {q(command)}", timeout=timeout, check=check)
     return ssh(remote, f"docker exec {q(container)} bash -lc {q(command)}", timeout=timeout, check=check)
 
 
@@ -176,11 +178,11 @@ def server_command(cfg: dict[str, Any]) -> str:
         str(server.get("mem_fraction_static", 0.90)),
     ]
     optional_parallel = [
-        ("atten_cp_size", "--attention-context-parallel-size"),
-        ("ep_size", "--expert-parallel-size"),
-        ("expert_parallel_size", "--expert-parallel-size"),
-        ("moe_dp_size", "--moe-data-parallel-size"),
-        ("dp_size", "--data-parallel-size"),
+        ("atten_cp_size", "--attn-cp-size"),
+        ("ep_size", "--ep-size"),
+        ("expert_parallel_size", "--ep-size"),
+        ("moe_dp_size", "--moe-dp-size"),
+        ("dp_size", "--dp-size"),
         ("moe_dense_tp_size", "--moe-dense-tp-size"),
     ]
     for key, flag in optional_parallel:

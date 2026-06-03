@@ -112,6 +112,7 @@ def summarize_server_excerpt(cfg: dict[str, Any], excerpt_file: str) -> dict[str
         "text=open(p, encoding='utf-8', errors='ignore').read() if os.path.exists(p) else '';"
         "pref=[(int(a),int(b),float(c)) for a,b,c in re.findall(r'#new-token:\\s*(\\d+).*?#cached-token:\\s*(\\d+).*?input throughput \\(token/s\\):\\s*([0-9.]+)', text)];"
         "dec=[float(x) for x in re.findall(r'gen throughput \\(token/s\\):\\s*([0-9.]+)', text)];"
+        "rq=[float(x) for x in re.findall(r'run[-_ ]?que(?:ue)?\\s*[:=]\\s*([0-9.]+)', text, flags=re.I)];"
         "new=sum(x[0] for x in pref); cached=sum(x[1] for x in pref);"
         "pin=[x[2] for x in pref if x[2] > 0];"
         "out={'server_prefill_batches':len(pref),'server_new_tokens':new,'server_cached_tokens':cached,"
@@ -119,7 +120,9 @@ def summarize_server_excerpt(cfg: dict[str, Any], excerpt_file: str) -> dict[str
         "'server_prefill_input_tps_avg':(statistics.mean(pin) if pin else None),"
         "'server_prefill_input_tps_max':(max(pin) if pin else None),"
         "'server_decode_batches':len(dec),'server_decode_gen_tps_avg':(statistics.mean(dec) if dec else None),"
-        "'server_decode_gen_tps_max':(max(dec) if dec else None)};"
+        "'server_decode_gen_tps_max':(max(dec) if dec else None),"
+        "'server_decode_run_queue_avg':(statistics.mean(rq) if rq else None),"
+        "'server_decode_run_queue_max':(max(rq) if rq else None)};"
         "print(json.dumps(out))"
     )
     result = docker_exec(remote, container, f"python -c {q(py)}", timeout=60, check=False)
@@ -186,7 +189,7 @@ def capture_server_excerpt(cfg: dict[str, Any], tag: str, start_line: int) -> st
     from_line = max(start_line + 1, 1)
     cmd = (
         f"tail -n +{from_line} {q(server_log)} | "
-        "grep -Ei 'Prefill batch|Decode batch|cached-token|new-token|gen throughput|input throughput|OOM|error|exception' "
+        "grep -Ei 'Prefill batch|Decode batch|cached-token|new-token|gen throughput|input throughput|run-que|run_queue|run queue|OOM|error|exception' "
         f"> {q(excerpt_file)} || true"
     )
     docker_exec(remote, container, cmd, timeout=60, check=False)
@@ -224,6 +227,7 @@ def run_point(cfg: dict[str, Any], layout: dict[str, Any], workload: dict[str, A
     cfg["benchmark"]["warmup_requests"] = int(workload.get("warmup_requests", cfg["benchmark"].get("warmup_requests", 30)))
     cfg["benchmark"]["dataset_name"] = workload.get("dataset_name", cfg["benchmark"].get("dataset_name", "random"))
     cfg["benchmark"]["random_range_ratio"] = float(workload.get("random_range_ratio", cfg["benchmark"].get("random_range_ratio", 1.0)))
+    hit_rate = float(workload.get("hit_rate", cfg["benchmark"].get("hit_rate", 0.0)))
     tag = f"{layout['name']}_{workload['name']}_rr{slug(rate_label(rate))}_mc{max_concurrency}"
     output_file = f"{remote_dir}/bench/{tag}.jsonl"
     log_file = f"{remote_dir}/logs/{tag}.log"
@@ -231,7 +235,7 @@ def run_point(cfg: dict[str, Any], layout: dict[str, Any], workload: dict[str, A
     cmd = f"""
 set -euo pipefail
 rm -f {q(output_file)}
-{bench_command(cfg, input_len, output_len, 0.0, max_concurrency, output_file)} > {q(log_file)} 2>&1
+{bench_command(cfg, input_len, output_len, hit_rate, max_concurrency, output_file)} > {q(log_file)} 2>&1
 tail -200 {q(log_file)}
 """
     logging.info("Benchmark %s", tag)
@@ -251,6 +255,7 @@ tail -200 {q(log_file)}
     server_excerpt = capture_server_excerpt(cfg, tag, server_start_line)
     data.update({k: v for k, v in summarize_server_excerpt(cfg, server_excerpt).items() if v not in (None, "")})
     output_tps = to_float(data.get("output_throughput"))
+    decode_sla_ms = float(cfg["benchmark"].get("sla", {}).get("mean_tpot_ms_lt", 75))
     row = {
         "layout": layout["name"],
         "phase": phase,
@@ -281,6 +286,11 @@ tail -200 {q(log_file)}
         "server_prefill_input_tps_max": data.get("server_prefill_input_tps_max", ""),
         "server_decode_gen_tps_avg": data.get("server_decode_gen_tps_avg", ""),
         "server_decode_gen_tps_max": data.get("server_decode_gen_tps_max", ""),
+        "server_decode_run_queue_avg": data.get("server_decode_run_queue_avg", ""),
+        "server_decode_run_queue_max": data.get("server_decode_run_queue_max", ""),
+        "decode_req_capacity_at_sla_ms": (output_tps / (1000 / decode_sla_ms) if not math.isnan(output_tps) else ""),
+        "radix_cache_hit_rate_target": hit_rate,
+        "server_observed_cache_ratio": data.get("server_observed_cache_ratio", ""),
         "server_cached_tokens": data.get("server_cached_tokens", ""),
         "server_new_tokens": data.get("server_new_tokens", ""),
         "server_log_excerpt": server_excerpt,
@@ -345,6 +355,22 @@ def run(args: argparse.Namespace) -> int:
         for r in rows
         if str(r.get("returncode")) == "0"
     }
+    if args.dry_run:
+        total = 0
+        for layout in layouts:
+            for workload in workloads:
+                for max_concurrency in max_concurrency_values(workload, concurrency_override):
+                    for rate in request_rates(workload, rate_override):
+                        total += 1
+                        logging.info(
+                            "Would run layout=%s workload=%s rr=%s mc=%s",
+                            layout["name"],
+                            workload["name"],
+                            rate_label(rate),
+                            max_concurrency,
+                        )
+        logging.info("Would run %d benchmark points across %d layouts and %d workloads", total, len(layouts), len(workloads))
+        return 0
     for layout in layouts:
         cfg = copy.deepcopy(cfg0)
         cfg["server"] = merge_server(cfg0["server_base"], layout)
@@ -387,6 +413,11 @@ def run(args: argparse.Namespace) -> int:
                     "server_prefill_input_tps_max": "",
                     "server_decode_gen_tps_avg": "",
                     "server_decode_gen_tps_max": "",
+                    "server_decode_run_queue_avg": "",
+                    "server_decode_run_queue_max": "",
+                    "decode_req_capacity_at_sla_ms": "",
+                    "radix_cache_hit_rate_target": "",
+                    "server_observed_cache_ratio": "",
                     "server_cached_tokens": "",
                     "server_new_tokens": "",
                     "server_log_excerpt": "",
@@ -442,6 +473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-concurrency-values", help="Comma-separated max-concurrency values overriding workload config.")
     parser.add_argument("--reuse-server", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-sla-fail", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
