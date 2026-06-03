@@ -53,7 +53,15 @@ def join_shell_args(args: list[Any]) -> str:
 
 def run_local(cmd: list[str], timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     logging.debug("Running local command: %s", " ".join(shlex.quote(x) for x in cmd))
-    result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    result = subprocess.run(
+        cmd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
     if result.stdout:
         logging.debug("stdout: %s", result.stdout[-4000:])
     if result.stderr:
